@@ -1,1 +1,134 @@
 https://mystorage9837.blob.core.windows.net/test/snapshot_2025-07-04_16-03.zip?sp=r&st=2025-08-05T21:15:59Z&se=2025-08-06T05:30:59Z&sv=2024-11-04&sr=b&sig=ZbM7tPC359W6Kl4RRdp%2FR%2BkQnZuxfVHpKZBCPW9mhCQ%3D
+
+
+<# 
+WamWatch.ps1
+------------
+Purpose: Detect whether **WAM** (Web Account Manager) returns **0 accounts** for an extended time after cold boot.
+
+How it works:
+- Uses WinRT `Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager`
+  to find the Azure AD provider and call `FindAllAccountsAsync(...)` in a loop.
+- Logs timestamp, count, and any discovered account usernames (UPNs).
+- Optional: target a specific tenant authority (GUID) or "organizations" (default).
+
+USAGE EXAMPLES
+--------------
+# Sample: watch for 5 minutes and log to Desktop
+powershell -ExecutionPolicy Bypass -File .\WamWatch.ps1 -DurationSeconds 300 -IntervalMs 1000 -Authority organizations
+
+# Target a specific tenant by GUID
+powershell -ExecutionPolicy Bypass -File .\WamWatch.ps1 -Authority 11111111-2222-3333-4444-555555555555
+
+# Increase verbosity and save to a custom CSV
+powershell -ExecutionPolicy Bypass -File .\WamWatch.ps1 -Verbose -LogPath C:\Temp\WamWatch.csv
+
+INTERPRETATION
+--------------
+- If you see **0 accounts** for many samples right after boot, then suddenly
+  it flips to 1 (or more), you've reproduced a **WAM account discovery delay**.
+- Run it *in parallel* with your Teams first launch to correlate timing.
+#>
+
+[CmdletBinding()]
+param(
+  # How long to watch (seconds)
+  [int]$DurationSeconds = 300,
+  # Polling interval (milliseconds)
+  [int]$IntervalMs = 1000,
+  # Azure AD authority to pass to WAM. Use "organizations" (default), "consumers", or your tenant GUID.
+  [string]$Authority = 'organizations',
+  # CSV log path (defaults to Desktop\WamWatchLog.csv)
+  [string]$LogPath
+)
+
+# Default log path
+if (-not $LogPath) {
+  $desktop = [Environment]::GetFolderPath('Desktop')
+  $LogPath = Join-Path $desktop 'WamWatchLog.csv'
+}
+
+# Prepare CSV header
+if (-not (Test-Path $LogPath)) {
+  "Timestamp,Count,Accounts" | Out-File -FilePath $LogPath -Encoding utf8
+}
+
+function Write-Log {
+  param([string]$Msg, [int]$Count, [string[]]$Accounts)
+  $ts = (Get-Date).ToString('s')
+  $acctJoined = $null
+  if ($Accounts -and $Accounts.Count -gt 0) {
+    $acctJoined = ($Accounts -join ';')
+  } else {
+    $acctJoined = ''
+  }
+  $line = "$ts,$Count,""{0}""" -f $acctJoined
+  Add-Content -Path $LogPath -Value $line
+  Write-Host ("{0}  count={1}  {2}" -f $ts, $Count, $Msg)
+}
+
+# WinRT types
+Add-Type -AssemblyName System.Runtime.WindowsRuntime | Out-Null
+
+# Helper to await WinRT IAsyncOperation<T>
+function Await {
+  param($AsyncOp)
+  $awaiter = $AsyncOp.GetType().GetMethod('AsTask').Invoke($AsyncOp, @())
+  $awaiter.Wait()
+  return $awaiter.Result
+}
+
+# Provider IDs (per Microsoft docs)
+$AadProviderId = 'https://login.microsoft.com'  # Microsoft Entra ID (Azure AD)
+# MSA would be 'https://login.live.com', but we focus on AAD here.
+
+try {
+  Write-Verbose "Finding AAD provider ($AadProviderId) with authority '$Authority'..."
+  $provider = Await ([Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager]::FindAccountProviderAsync($AadProviderId, $Authority))
+  if (-not $provider) { throw "Could not find AAD provider. Are WAM components healthy?" }
+  Write-Verbose ("Provider display name: {0}" -f $provider.DisplayName)
+} catch {
+  Write-Error "Failed to resolve AAD provider: $_"
+  exit 1
+}
+
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$end = (Get-Date).AddSeconds($DurationSeconds)
+
+[int]$zeroStreak = 0
+[int]$maxZeroStreak = 0
+
+while ((Get-Date) -lt $end) {
+  try {
+    # Enumerate all AAD accounts known to WAM
+    $accounts = Await ([Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager]::FindAllAccountsAsync($provider))
+    $count = 0
+    $names = @()
+    if ($accounts) {
+      $count = $accounts.Count
+      foreach ($acct in $accounts) {
+        # WebAccount has UserName; fallback to Id
+        $name = $acct.UserName
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = $acct.Id }
+        $names += $name
+      }
+    }
+
+    if ($count -eq 0) {
+      $zeroStreak++
+      if ($zeroStreak -gt $maxZeroStreak) { $maxZeroStreak = $zeroStreak }
+      Write-Log -Msg "WAM returned 0 accounts" -Count 0 -Accounts @()
+    } else {
+      $zeroStreak = 0
+      Write-Log -Msg ("WAM returned {0} account(s): {1}" -f $count, ($names -join ', ')) -Count $count -Accounts $names
+    }
+  } catch {
+    Write-Log -Msg ("Error calling FindAllAccountsAsync: {0}" -f $_.Exception.Message) -Count -1 -Accounts @()
+  }
+
+  Start-Sleep -Milliseconds $IntervalMs
+}
+
+$stopwatch.Stop()
+Write-Host ("Done. Max consecutive 0-account results: {0}" -f $maxZeroStreak)
+Write-Host ("CSV log: {0}" -f $LogPath)
